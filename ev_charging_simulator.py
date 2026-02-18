@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any, Callable, Optional
 
 # --- GUI backend: try PyQt5 first, fallback to Tkinter ---
@@ -404,15 +405,15 @@ LEGEND_EDGE = "#4a5568"
 
 
 def _format_time_12h(hour: float) -> str:
-    """Format hour (0–24) as 12:00 AM/PM (integer hour only, for axis ticks)."""
+    """Format hour (0–24) as 12 AM/PM (integer hour only, for axis ticks; no :00)."""
     h = int(hour) % 24
     if h == 0:
-        return "12:00 AM"
+        return "12 AM"
     if h == 12:
-        return "12:00 PM"
+        return "12 PM"
     if h < 12:
-        return f"{h}:00 AM"
-    return f"{h - 12}:00 PM"
+        return f"{h} AM"
+    return f"{h - 12} PM"
 
 
 def _format_time_12h_with_minutes(hour: float) -> str:
@@ -472,6 +473,8 @@ class EVChargingFigure:
         self._marker_plug: Optional[Line2D] = None
         self._marker_depart: Optional[Line2D] = None
         self._warning_text: Optional[Any] = None
+        self._energy_fill: Optional[Any] = None  # PolyCollection from fill_between (for fast light redraw)
+        self._soc_line: Optional[Line2D] = None
         self._connect_events()
 
     def _create_axes(self) -> None:
@@ -587,7 +590,7 @@ class EVChargingFigure:
         self._redraw_schedule()
 
     def _redraw_schedule(self, light: bool = False) -> None:
-        """Recompute schedule and redraw. If light=True, skip TOU price subplot (faster during drag)."""
+        """Recompute schedule and redraw. If light=True, update existing artists only (no clear) for smooth drag."""
         (
             energy_schedule,
             total_energy_kwh,
@@ -610,6 +613,51 @@ class EVChargingFigure:
         )
 
         t = get_time_axis()
+        # Fast path: update existing artists only (no ax.clear), keeps live updates smooth
+        if light and self._energy_fill is not None and self._soc_line is not None:
+            verts = np.vstack([
+                np.column_stack([t, np.zeros(N_STEPS)]),
+                np.column_stack([t[::-1], energy_schedule[::-1]]),
+            ])
+            self._energy_fill.set_verts([verts])
+            soc_curve = np.concatenate([
+                [self.soc_start_pct],
+                self.soc_start_pct + 100.0 * np.cumsum(energy_schedule) / self.battery_kwh,
+            ])
+            t_soc = np.linspace(0, HOURS_PER_DAY, N_STEPS + 1)
+            self._soc_line.set_xdata(t_soc)
+            self._soc_line.set_ydata(soc_curve)
+            self._update_markers_artists()
+            self.fig.suptitle(
+                f"Energy: {total_energy_kwh:.1f} kWh  |  Cost: ${total_cost_usd:.2f}  |  "
+                f"CO2: {total_co2_lbs:.1f} lb  |  Final SOC: {final_soc_pct:.1f}%",
+                fontsize=11,
+                color=TEXT_COLOR,
+            )
+            if not target_achieved and total_energy_kwh > 0:
+                if self._warning_text:
+                    self._warning_text.set_visible(True)
+                    self._warning_text.set_text(
+                        "Target SOC not achievable in window; consider earlier plug-in or later departure."
+                    )
+                else:
+                    self._warning_text = self.fig.text(
+                        0.5, 0.84,
+                        "Target SOC not achievable in window; consider earlier plug-in or later departure.",
+                        ha="center", fontsize=14, color="#ff8a80", wrap=True,
+                    )
+            else:
+                if self._warning_text:
+                    self._warning_text.set_visible(False)
+            self._last_result = (
+                total_energy_kwh,
+                total_cost_usd,
+                total_co2_lbs,
+                final_soc_pct,
+                target_achieved,
+            )
+            return
+
         prices = get_tou_prices_array(self.season, self.peak_windows, self.season_profiles)
         prices_tuple, _ = self.season_profiles.get(
             self.season, list(self.season_profiles.values())[0]
@@ -640,7 +688,7 @@ class EVChargingFigure:
         # --- Energy subplot ---
         self.ax_energy.clear()
         self.ax_energy.set_facecolor(AXES_FACE)
-        self.ax_energy.fill_between(t, 0, energy_schedule, color=ACCENT_BLUE, alpha=0.75)
+        self._energy_fill = self.ax_energy.fill_between(t, 0, energy_schedule, color=ACCENT_BLUE, alpha=0.75)
         self.ax_energy.set_ylabel("Energy (kWh)", color=TEXT_COLOR)
         self.ax_energy.set_ylim(0, max(self.charge_rate_kw * TIME_STEP_HOURS * 1.2, 1))
         self.ax_energy.grid(True, alpha=0.4, color=GRID_COLOR)
@@ -695,7 +743,7 @@ class EVChargingFigure:
         t_soc = np.linspace(0, HOURS_PER_DAY, N_STEPS + 1)
         for ps, pe in self.peak_windows:
             self.ax_soc.axvspan(ps, pe, color=PEAK_FILL, alpha=PEAK_ALPHA)
-        (soc_line,) = self.ax_soc.plot(t_soc, soc_curve, color=ACCENT_GREEN, linewidth=2, label="SOC")
+        (self._soc_line,) = self.ax_soc.plot(t_soc, soc_curve, color=ACCENT_GREEN, linewidth=2, label="SOC")
         self.ax_soc.axhline(self.soc_target_pct, color=TEXT_COLOR, linestyle="--", alpha=0.6)
         if self.taper_enabled:
             taper_start = _taper_start_pct(self.soc_target_pct)
@@ -706,7 +754,7 @@ class EVChargingFigure:
         self.ax_soc.grid(True, alpha=0.4, color=GRID_COLOR)
         # Proxy artists for hlines so they appear in legend
         soc_handles = [
-            soc_line,
+            self._soc_line,
             Line2D([0], [0], color=TEXT_COLOR, linestyle="--", linewidth=1.5, label="Target SOC"),
             *([Line2D([0], [0], color=ACCENT_ORANGE, linestyle=":", linewidth=1.5, label="Taper start")] if self.taper_enabled else []),
             Patch(facecolor=PEAK_FILL, alpha=PEAK_ALPHA, edgecolor="none", label="Peak hours"),
@@ -994,14 +1042,14 @@ if USE_PYQT:
             ]
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._tick)
-            self._timer_interval = 80
+            self._timer_interval = 33  # 30 FPS default
             self._timer.start(self._timer_interval)
 
         def set_season(self, season: str) -> None:
             self.season = season
 
         def set_update_interval(self, ms: int) -> None:
-            self._timer_interval = max(40, min(200, ms))
+            self._timer_interval = max(16, min(100, ms))  # 60 FPS–15 FPS range
             self._timer.stop()
             self._timer.start(self._timer_interval)
 
@@ -1131,6 +1179,9 @@ if USE_PYQT:
             self.taper_check = QCheckBox("Enable charge taper (Tesla-like power reduction near target SOC)")
             self.taper_check.setChecked(ev_figure.taper_enabled)
             layout.addWidget(self.taper_check)
+            self.update_while_drag_check = QCheckBox("Update schedule while dragging (heavier, may lag)")
+            self.update_while_drag_check.setChecked(getattr(parent, "update_schedule_while_dragging", True))
+            layout.addWidget(self.update_while_drag_check)
             bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
             bbox.accepted.connect(self.accept)
             bbox.rejected.connect(self.reject)
@@ -1200,6 +1251,9 @@ if USE_PYQT:
             self.ev_figure.peak_windows = new_peak_windows
             self.ev_figure.season_profiles = new_profiles
             self.ev_figure.taper_enabled = self.taper_check.isChecked()
+            parent = self.parent()
+            if hasattr(parent, "update_schedule_while_dragging"):
+                parent.update_schedule_while_dragging = self.update_while_drag_check.isChecked()
             super().accept()
 
 
@@ -1208,7 +1262,8 @@ class EVChargingMainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("EV Optimal Charging Schedule Simulator")
+        self._base_title_qt = "EV Optimal Charging Schedule Simulator"
+        self.setWindowTitle(self._base_title_qt)
         self.setMinimumSize(1000, 800)
         self.setStyleSheet(QT_STYLESHEET)
         _set_window_icon(self)
@@ -1261,8 +1316,8 @@ class EVChargingMainWindow(QMainWindow):
         top_row.addSpacing(20)
         top_row.addWidget(QLabel("Update rate:"))
         self.update_rate_combo = QComboBox()
-        self.update_rate_combo.addItems(["Default", "Higher performance", "Low performance"])
-        self.update_rate_combo.setCurrentText("Default")
+        self.update_rate_combo.addItems(["Smoothest", "Smooth", "Balanced", "Reduced"])
+        self.update_rate_combo.setCurrentText("Smoothest")
         self.update_rate_combo.currentTextChanged.connect(self._on_update_rate_changed)
         top_row.addWidget(self.update_rate_combo)
         top_row.addStretch()
@@ -1360,24 +1415,48 @@ class EVChargingMainWindow(QMainWindow):
         self._slider_block = False
         self._drag_redraw_timer = QTimer(self)
         self._drag_redraw_timer.setSingleShot(True)
-        self._drag_redraw_timer.timeout.connect(self._do_drag_redraw)
-        self._drag_throttle_ms = 80
-        self._season_interval_ms = 80
+        self._drag_redraw_timer.timeout.connect(self._on_drag_redraw_timer_fired)
+        self._drag_throttle_ms = 8  # default 120 fps
+        self._last_drag_redraw_time = 0.0
+        self._last_drag_frame_ms = 0.0  # diagnostic: actual ms per drag redraw
+        self.update_schedule_while_dragging = True  # default: live schedule updates while dragging
         self.ev_figure.draw_initial()
         self._update_labels()
         self._sync_sliders_from_figure()
         self.ev_figure.on_schedule_change = self._on_schedule_changed
         self.ev_figure.on_marker_moved = self._on_marker_moved_throttled
     def _on_marker_moved_throttled(self) -> None:
-        """Throttled redraw during time-marker drag; interval from Update rate."""
-        self._drag_redraw_timer.start(self._drag_throttle_ms)
+        """Rate-limited redraw during time-marker drag at selected FPS (same as refresh rate)."""
+        now_ms = time.perf_counter() * 1000
+        elapsed = now_ms - self._last_drag_redraw_time
+        if elapsed >= self._drag_throttle_ms or self._last_drag_redraw_time == 0:
+            self._last_drag_redraw_time = now_ms
+            self._drag_redraw_timer.stop()
+            self._do_drag_redraw()
+        elif not self._drag_redraw_timer.isActive():
+            remaining = int(self._drag_throttle_ms - elapsed)
+            if remaining > 0:
+                self._drag_redraw_timer.start(remaining)
+
+    def _on_drag_redraw_timer_fired(self) -> None:
+        self._last_drag_redraw_time = time.perf_counter() * 1000
+        self._do_drag_redraw()
 
     def _do_drag_redraw(self) -> None:
-        """Run a light schedule redraw and sync UI (used during drag)."""
-        self.ev_figure._redraw_schedule(light=True)
-        self._sync_sliders_from_figure()
-        self._update_labels()
+        """During marker drag: if setting enabled, run light schedule redraw; else only sync sliders/time labels."""
+        t0 = time.perf_counter()
+        if self.update_schedule_while_dragging:
+            self.ev_figure._redraw_schedule(light=True)
+            self._sync_sliders_from_figure()
+            self._update_labels()
+        else:
+            self._sync_sliders_from_figure()
         self.canvas.draw_idle()
+        self._last_drag_frame_ms = (time.perf_counter() - t0) * 1000
+        # Diagnostic: if frame ms << throttle ms, FPS limit is the bottleneck; if frame ms >= throttle, computation is
+        self.setWindowTitle(
+            f"{self._base_title_qt} — drag: {self._last_drag_frame_ms:.0f} ms (limit: {self._drag_throttle_ms} ms)"
+        )
 
     def _on_mode_changed(self, mode: str) -> None:
         self.ev_figure.set_optimization_mode(mode)
@@ -1385,16 +1464,15 @@ class EVChargingMainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _on_update_rate_changed(self, text: str) -> None:
-        if text == "Higher performance":
-            self._drag_throttle_ms = 40
-            self._season_interval_ms = 50
-        elif text == "Low performance":
-            self._drag_throttle_ms = 150
-            self._season_interval_ms = 150
+        # Update rate only affects graph/drag redraw; overlay (rain/snow) runs at fixed 30 FPS
+        if text == "Smoothest":
+            self._drag_throttle_ms = 8
+        elif text == "Smooth":
+            self._drag_throttle_ms = 17
+        elif text == "Reduced":
+            self._drag_throttle_ms = 67
         else:
-            self._drag_throttle_ms = 80
-            self._season_interval_ms = 80
-        self.centralWidget().season_overlay().set_update_interval(self._season_interval_ms)
+            self._drag_throttle_ms = 33  # Balanced
 
     def _on_configure_settings(self) -> None:
         d = SettingsDialog(self, self.ev_figure)
@@ -1509,7 +1587,8 @@ class EVChargingTkApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("EV Optimal Charging Schedule Simulator")
+        self._base_title_tk = "EV Optimal Charging Schedule Simulator"
+        self.root.title(self._base_title_tk)
         self.root.minsize(1000, 800)
         self.root.configure(bg="#1a1b2e")
         self._slider_block = False
@@ -1527,8 +1606,8 @@ class EVChargingTkApp:
             (np.random.random(), np.random.random(), np.random.uniform(0.002, 0.008), np.random.uniform(1.5, 4))
             for _ in range(25)
         ]
-        self._tk_animate_interval = 80
-        self._tk_drag_throttle_ms = 80
+        self._tk_overlay_interval = 33  # fixed 30 FPS for rain/snow/summer (independent of Update rate)
+        self._tk_drag_throttle_ms = 8  # default 120 fps
         self._tk_season_animate()
 
         # Menu: Configure -> Settings (high-contrast so it's easy to see)
@@ -1577,10 +1656,10 @@ class EVChargingTkApp:
         self.charger_entry.bind("<FocusOut>", self._on_charger_changed)
         ttk.Label(top, text="(1–350)").pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(top, text="Update rate:").pack(side=tk.LEFT, padx=(16, 4))
-        self.update_rate_var = tk.StringVar(value="Default")
+        self.update_rate_var = tk.StringVar(value="Smoothest")
         self.update_rate_combo = ttk.Combobox(
             top, textvariable=self.update_rate_var,
-            values=["Default", "Higher performance", "Low performance"], state="readonly", width=18
+            values=["Smoothest", "Smooth", "Balanced", "Reduced"], state="readonly", width=12
         )
         self.update_rate_combo.pack(side=tk.LEFT, padx=(0, 8))
         self.update_rate_combo.bind("<<ComboboxSelected>>", self._on_update_rate_changed)
@@ -1670,22 +1749,43 @@ class EVChargingTkApp:
         self._sync_sliders_from_figure()
         self._draw_tk_battery(SOC_START_PCT)
         self.ev_figure.on_marker_moved = self._on_marker_moved_throttled
+        self._tk_last_drag_redraw_time = 0.0
+        self._last_drag_frame_ms = 0.0  # diagnostic: actual ms per drag redraw
+        self._update_schedule_while_dragging = True  # default: live schedule updates while dragging
         # Tk overlay stays at back (opaque canvas would cover UI if raised); season effects visible in PyQt only when raised
 
     def _on_marker_moved_throttled(self) -> None:
-        """Throttled redraw during time-marker drag; interval from Update rate."""
-        if self._drag_redraw_after_id is not None:
-            self.root.after_cancel(self._drag_redraw_after_id)
-        self._drag_redraw_after_id = self.root.after(self._tk_drag_throttle_ms, self._tk_do_drag_redraw)
+        """Rate-limited redraw during time-marker drag at selected FPS (same as refresh rate)."""
+        now_ms = time.perf_counter() * 1000
+        elapsed = now_ms - self._tk_last_drag_redraw_time
+        if elapsed >= self._tk_drag_throttle_ms or self._tk_last_drag_redraw_time == 0:
+            self._tk_last_drag_redraw_time = now_ms
+            if self._drag_redraw_after_id is not None:
+                self.root.after_cancel(self._drag_redraw_after_id)
+                self._drag_redraw_after_id = None
+            self._tk_do_drag_redraw()
+        elif self._drag_redraw_after_id is None:
+            remaining = int(self._tk_drag_throttle_ms - elapsed)
+            if remaining > 0:
+                self._drag_redraw_after_id = self.root.after(remaining, self._tk_do_drag_redraw)
 
     def _tk_do_drag_redraw(self) -> None:
-        """Run a light schedule redraw and sync UI (used during drag)."""
+        """During marker drag: if setting enabled, run light schedule redraw; else only sync sliders/time labels."""
         self._drag_redraw_after_id = None
-        self.ev_figure._redraw_schedule(light=True)
-        self._sync_sliders_from_figure()
-        self._update_labels()
-        self._draw_tk_battery(self.ev_figure.get_last_result()[3])
+        self._tk_last_drag_redraw_time = time.perf_counter() * 1000
+        t0 = time.perf_counter()
+        if self._update_schedule_while_dragging:
+            self.ev_figure._redraw_schedule(light=True)
+            self._sync_sliders_from_figure()
+            self._update_labels()
+        else:
+            self._sync_sliders_from_figure()
         self.canvas.draw_idle()
+        self._last_drag_frame_ms = (time.perf_counter() - t0) * 1000
+        # Diagnostic: if frame ms << throttle ms, FPS limit is the bottleneck; if frame ms >= throttle, computation is
+        self.root.title(
+            f"{self._base_title_tk} — drag: {self._last_drag_frame_ms:.0f} ms (limit: {self._tk_drag_throttle_ms} ms)"
+        )
 
     def _tk_battery_body_rect(self) -> tuple:
         w, h = 70, 260
@@ -1787,7 +1887,7 @@ class EVChargingTkApp:
                 self._tk_rain[i] = (x_n, (y_n + spd) % 1.0, spd)
                 px, py = x_n * w, y_n * h
                 c.create_line(px, py, px + 2, py + 14, fill="#c8dcff", width=1)
-        self.root.after(self._tk_animate_interval, self._tk_season_animate)
+        self.root.after(self._tk_overlay_interval, self._tk_season_animate)
 
     def _on_mode_changed(self, event=None) -> None:
         self.ev_figure.set_optimization_mode(self.mode_var.get())
@@ -1795,16 +1895,16 @@ class EVChargingTkApp:
         self.canvas.draw_idle()
 
     def _on_update_rate_changed(self, event=None) -> None:
+        # Update rate only affects graph/drag redraw; overlay (rain/snow) runs at fixed 30 FPS
         text = self.update_rate_var.get()
-        if text == "Higher performance":
-            self._tk_drag_throttle_ms = 40
-            self._tk_animate_interval = 50
-        elif text == "Low performance":
-            self._tk_drag_throttle_ms = 150
-            self._tk_animate_interval = 150
+        if text == "Smoothest":
+            self._tk_drag_throttle_ms = 8
+        elif text == "Smooth":
+            self._tk_drag_throttle_ms = 17
+        elif text == "Reduced":
+            self._tk_drag_throttle_ms = 67
         else:
-            self._tk_drag_throttle_ms = 80
-            self._tk_animate_interval = 80
+            self._tk_drag_throttle_ms = 33  # Balanced
 
     def _tk_open_settings(self) -> None:
         """Open Settings dialog (Toplevel): TOU times, season table, taper checkbox. Dark theme with good contrast."""
@@ -1865,6 +1965,12 @@ class EVChargingTkApp:
             bg="#1a1b2e", fg="#e8e6e3", selectcolor="#16213e", activebackground="#1a1b2e", activeforeground="#e8e6e3"
         )
         taper_cb.pack(anchor=tk.W, pady=8)
+        update_while_drag_var = tk.BooleanVar(value=self._update_schedule_while_dragging)
+        update_while_drag_cb = tk.Checkbutton(
+            f, text="Update schedule while dragging (heavier, may lag)", variable=update_while_drag_var,
+            bg="#1a1b2e", fg="#e8e6e3", selectcolor="#16213e", activebackground="#1a1b2e", activeforeground="#e8e6e3"
+        )
+        update_while_drag_cb.pack(anchor=tk.W, pady=4)
 
         def ok() -> None:
             try:
@@ -1892,6 +1998,7 @@ class EVChargingTkApp:
             self.ev_figure.peak_windows = new_peak_windows
             self.ev_figure.season_profiles = new_profiles
             self.ev_figure.taper_enabled = taper_var.get()
+            self._update_schedule_while_dragging = update_while_drag_var.get()
             win.destroy()
             self.ev_figure._redraw_schedule()
             self._sync_sliders_from_figure()
