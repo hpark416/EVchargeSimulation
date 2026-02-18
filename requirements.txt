@@ -1,0 +1,15 @@
+# EV Optimal Charging Schedule Simulator
+# Python 3.10+
+
+numpy>=1.21.0
+matplotlib>=3.5.0
+
+# Optional: PyQt5 for preferred GUI (falls back to Tkinter if not installed)
+PyQt5>=5.15.0
+
+# Optional: generate Word document from algorithm response
+python-docx>=0.8.11
+
+# Optional: package app as .exe (Windows) or .app/.dmg (macOS)
+# pip install pyinstaller && pyinstaller ev_charging_simulator.spec
+pyinstaller>=6.0.0
